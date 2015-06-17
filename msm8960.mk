@@ -67,6 +67,10 @@ PRODUCT_PROPERTY_OVERRIDES += \
     camera2.portability.force_api=1
 
 PRODUCT_PROPERTY_OVERRIDES += \
+    persist.sys.media.use-awesome=true \
+    media.stagefright.use-awesome=true
+
+PRODUCT_PROPERTY_OVERRIDES += \
     persist.data_netmgrd_nint=16 \
     persist.radio.add_power_save=1 \
     persist.radio.mode_pref_nv10=1 \
@@ -101,9 +105,6 @@ PRODUCT_PROPERTY_OVERRIDES += \
 
 PRODUCT_PROPERTY_OVERRIDES += \
     wifi.interface=wlan0
-
-PRODUCT_PROPERTY_OVERRIDES += \
-    ro.enable_boot_charger_mode=1
 
 # Audio
 PRODUCT_PACKAGES += \
@@ -147,7 +148,21 @@ PRODUCT_PACKAGES += \
 PRODUCT_COPY_FILES += \
     $(LOCAL_PATH)/configs/media_codecs.xml:system/etc/media_codecs.xml
 
+# NFC
+PRODUCT_PACKAGES += \
+    libnfc \
+    libnfc_jni \
+    Nfc \
+    Tag \
+    com.android.nfc_extras
 
+ifeq ($(TARGET_BUILD_VARIANT),user)
+    NFCEE_ACCESS_PATH := $(LOCAL_PATH)/configs/nfcee_access.xml
+else
+    NFCEE_ACCESS_PATH := $(LOCAL_PATH)/configs/nfcee_access_debug.xml
+endif
+PRODUCT_COPY_FILES += \
+    $(NFCEE_ACCESS_PATH):system/etc/nfcee_access.xml
 
 # OMX
 PRODUCT_PACKAGES += \
@@ -182,8 +197,7 @@ PRODUCT_COPY_FILES += \
 
 # USB
 PRODUCT_PACKAGES += \
-    com.android.future.usb.accessory
-PRODUCT_PROPERTY_OVERRIDES += \
+    com.android.future.usb.accessory \
     persist.sys.isUsbOtgEnabled=true
 
 # Wifi

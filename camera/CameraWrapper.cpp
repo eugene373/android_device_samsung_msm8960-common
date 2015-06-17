@@ -32,7 +32,7 @@
 #include <hardware/hardware.h>
 #include <hardware/camera.h>
 #include <camera/Camera.h>
-#include <camera/CameraParameters2.h>
+#include <camera/CameraParameters.h>
 #include <dlfcn.h>
 
 #define BACK_CAMERA_ID 0
@@ -43,8 +43,11 @@ using namespace android;
 static Mutex gCameraWrapperLock;
 static camera_module_t *gVendorModule = 0;
 
-#ifdef DERP2
+#ifndef DISABLE_AUTOFOCUS
 static bool CAF = false;
+#endif
+#ifdef SAMSUNG_CAMERA_MODE
+static bool wasVideo = false;
 #endif
 
 static int camera_device_open(const hw_module_t *module, const char *name,
@@ -277,6 +280,10 @@ static int camera_auto_focus(struct camera_device *device)
 
     if (!device)
         return -EINVAL;
+#ifndef DISABLE_AUTOFOCUS
+     if (CAF)
+         camera_send_command(device, 1552, 0, 0);
+#endif
 
     return VENDOR_CALL(device, auto_focus);
 }
@@ -294,7 +301,7 @@ static int camera_cancel_auto_focus(struct camera_device *device)
     /* APEXQ/EXPRESS: Calling cancel_auto_focus causes the camera to crash for unknown reasons.
      * Disabling it has no adverse effect. For others, only call cancel_auto_focus when the
      * preview is enabled. This is needed so some 3rd party camera apps don't lock up. */
-#ifdef DERP2
+#ifndef DISABLE_AUTOFOCUS
     if (camera_preview_enabled(device)) {
         if (!CAF) {
         //ret = VENDOR_CALL(device, cancel_auto_focus);
@@ -340,13 +347,16 @@ static int camera_set_parameters(struct camera_device *device,
 
     int id = CAMERA_ID(device);
 
-#ifdef LOG_PARAMETERS
-    ALOGV("Raw set_parameters");
-    __android_log_write(ANDROID_LOG_VERBOSE, LOG_TAG, settings);
-#endif
-
-    CameraParameters2 params;
+    CameraParameters params;
     params.unflatten(String8(settings));
+
+    const char* camMode = params.get(CameraParameters::KEY_SAMSUNG_CAMERA_MODE);
+
+    // jactive device camera don't seem to have recording hint param, so read it safely
+    const char* recordingHint = params.get(CameraParameters::KEY_RECORDING_HINT);
+    bool isVideo = false;
+    if (recordingHint)
+        isVideo = !strcmp(recordingHint, "true");
 
     // fix params here
     // No need to fix-up ISO_HJR, it is the same for userspace and the camera lib
@@ -364,26 +374,40 @@ static int camera_set_parameters(struct camera_device *device,
             params.set(CameraParameters::KEY_ISO_MODE, "1600");
     }
 
-#ifdef DERP2
-    bool isVideo = false;
-    if (params.get(CameraParameters::KEY_RECORDING_HINT))
-        isVideo = !strcmp(params.get(CameraParameters::KEY_RECORDING_HINT), "true");
-
+#ifdef SAMSUNG_CAMERA_MODE
+    /* Samsung camcorder mode */
     if (id == FRONT_CAMERA_ID) {
-        int camMode;
-        if (params.get(CameraParameters::KEY_SAMSUNG_CAMERA_MODE)) {
-            camMode = params.getInt(CameraParameters::KEY_SAMSUNG_CAMERA_MODE);
-        } else {
-            camMode = -1;
-        }
-
-        if (camMode == -1) {
-            params.set(CameraParameters::KEY_SAMSUNG_CAMERA_MODE, "1");
-        } else {
+    /* Enable for front camera only */
+        if (!(!strcmp(camMode, "1") && !isVideo) || wasVideo) {
+        /* Enable only if not already set (Snapchat) but do enable if the setting is left
+        over while switching from stills to video */
+            if ((!strcmp(params.get(CameraParameters::KEY_PREVIEW_FRAME_RATE), "15") ||
+               (!strcmp(params.get(CameraParameters::KEY_PREVIEW_SIZE), "320x240") &&
+               !strcmp(params.get(CameraParameters::KEY_JPEG_QUALITY), "96"))) && !isVideo) {
+                /* Do not set for video chat in Hangouts (Frame rate 15) or Skype (Preview size 320x240
+                and jpeg quality 96 */
+            } else {
+            /* "Normal case". Required to prevent distorted video and reboots while taking snaps */
             params.set(CameraParameters::KEY_SAMSUNG_CAMERA_MODE, isVideo ? "1" : "0");
+            }
+            wasVideo = (isVideo || wasVideo);
         }
+    } else {
+    wasVideo = false;
     }
+#endif
+#ifdef ENABLE_ZSL
+    params.set(CameraParameters::KEY_ZSL, isVideo ? "off" : "on");
+    params.set(CameraParameters::KEY_CAMERA_MODE, isVideo ? "0" : "1");
 
+    /* Remove video-size, d2 doesn't support separate video stream */
+    params.remove(CameraParameters::KEY_VIDEO_SIZE);
+#endif
+
+    // Don't send mangled ISO modes pref back to the camera firmware
+    params.remove(CameraParameters::KEY_SUPPORTED_ISO_MODES);
+
+#ifndef DISABLE_AUTOFOCUS
     /* Are we in continuous focus mode? */
     if (strcmp(params.get(CameraParameters::KEY_FOCUS_MODE), "infinity") &&
        strcmp(params.get(CameraParameters::KEY_FOCUS_MODE), "fixed") && (id == BACK_CAMERA_ID)) {
@@ -394,22 +418,14 @@ static int camera_set_parameters(struct camera_device *device,
     }
 #endif
 
-    // Don't send mangled ISO modes pref back to the camera firmware
-    params.remove(CameraParameters::KEY_SUPPORTED_ISO_MODES);
-
     String8 strParams = params.flatten();
-
-#ifdef LOG_PARAMETERS
-    ALOGV("Fixed set_parameters");
-    __android_log_write(ANDROID_LOG_VERBOSE, LOG_TAG, strParams);
-#endif
 
     return VENDOR_CALL(device, set_parameters, strParams);
 }
 
 const static char * iso_values[] = {"auto,"
 "ISO100,ISO200,ISO400,ISO800"
-#ifdef DERP2
+#ifdef ISO_MODE_1600
 ",ISO1600"
 #endif
 ,"auto"};
@@ -425,42 +441,45 @@ static char *camera_get_parameters(struct camera_device *device)
     int id = CAMERA_ID(device);
 
     char *parameters = VENDOR_CALL(device, get_parameters);
-
-#ifdef LOG_PARAMETERS
-    ALOGV("Raw get_parameters");
-    __android_log_write(ANDROID_LOG_VERBOSE, LOG_TAG, parameters);
-#endif
-
     wrapper_camera_device_t *wrapper = (wrapper_camera_device_t *)device;
 
-    CameraParameters2 params;
+    CameraParameters params;
     params.unflatten(String8(parameters));
 
     // fix params here
-    params.set(CameraParameters::KEY_SUPPORTED_ISO_MODES, iso_values[id]);
+    params.set(CameraParameters::KEY_SUPPORTED_ISO_MODES, iso_values[CAMERA_ID(device)]);
 
-#ifdef DERP2
+#ifdef EXPOSURE_HACK
     params.set(CameraParameters::KEY_EXPOSURE_COMPENSATION_STEP, "0.5");
     params.set(CameraParameters::KEY_MIN_EXPOSURE_COMPENSATION, "-4");
     params.set(CameraParameters::KEY_MAX_EXPOSURE_COMPENSATION, "4");
-
-    /* Sure, it's supported, but not here */
-    params.set(CameraParameters::KEY_VIDEO_SNAPSHOT_SUPPORTED, "false");
 #endif
 
 #ifdef PREVIEW_SIZE_FIXUP
     params.set(CameraParameters::KEY_PREFERRED_PREVIEW_SIZE_FOR_VIDEO, id ? "640x480" : "800x480");
 #endif
 
-    params.set(CameraParameters::KEY_MAX_NUM_DETECTED_FACES_HW, "0");
-    params.set(CameraParameters::KEY_MAX_NUM_DETECTED_FACES_SW, "0");
-    params.set(CameraParameters::KEY_FACE_DETECTION, "off");
-    params.set(CameraParameters::KEY_SUPPORTED_FACE_DETECTION, "off");
+#ifndef DISABLE_FACE_DETECTION_BOTH_CAMERAS
+    /* Disable face detection for front facing camera */
+    if(CAMERA_ID(device) == FRONT_CAMERA_ID) {
+#endif
+        params.set(CameraParameters::KEY_MAX_NUM_DETECTED_FACES_HW, "0");
+        params.set(CameraParameters::KEY_MAX_NUM_DETECTED_FACES_SW, "0");
+        params.set(CameraParameters::KEY_FACE_DETECTION, "off");
+        params.set(CameraParameters::KEY_SUPPORTED_FACE_DETECTION, "off");
+#ifndef DISABLE_FACE_DETECTION_BOTH_CAMERAS
+    }
+#endif
 
-    char *ret = strdup(params.flatten().string());
-    VENDOR_CALL(device, put_parameters, parameters);
+#ifdef ENABLE_ZSL
+    /* Remove video-size, d2 doesn't support separate video stream */
+    params.remove(CameraParameters::KEY_VIDEO_SIZE);
+#endif
 
-    return ret;
+    /* Sure, it's supported, but not here */
+    params.set(CameraParameters::KEY_VIDEO_SNAPSHOT_SUPPORTED, "false");
+
+    return strdup(params.flatten().string());
 }
 
 static void camera_put_parameters(struct camera_device *device, char *params)
@@ -559,6 +578,10 @@ static int camera_device_open(const hw_module_t *module, const char *name,
     int cameraid;
     wrapper_camera_device_t *camera_device = NULL;
     camera_device_ops_t *camera_ops = NULL;
+
+#ifdef SAMSUNG_CAMERA_MODE
+    wasVideo = false;
+#endif
 
     Mutex::Autolock lock(gCameraWrapperLock);
 
